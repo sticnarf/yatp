@@ -9,3 +9,5 @@ license = "Apache-2.0"
 repository = "https://github.com/tikv/yatp/"
 
 [dependencies]
+parking_lot_core = "0.6"
+crossbeam-deque = "0.7"
