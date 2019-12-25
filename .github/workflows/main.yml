@@ -1,0 +1,22 @@
+name: CI
+
+on: [push]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        rust: [stable, beta, nightly]
+    runs-on: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          profile: minimal
+          override: true
+      - name: Run tests
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          cargo test --all --all-features -- --nocapture
