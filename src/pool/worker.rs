@@ -24,7 +24,7 @@ where
     fn pop(&mut self) -> Option<Pop<T>> {
         // Wait some time before going to sleep, which is more expensive.
         let mut spin = SpinWait::new();
-        for _ in 0..10 {
+        for _ in 0..3 {
             // By default we don't steal other workers to reduce the cost of pop.
             // But we will always try to steal other workers before going to sleep.
             if let Some(t) = self.local.pop(false) {
