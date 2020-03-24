@@ -5,11 +5,12 @@
 //! The instant when the task cell is pushed into the queue is recorded
 //! in the extras.
 
-use super::{Pop, TaskCell};
+use super::{LocalQueueBuilder, Pop, TaskCell};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use rand::prelude::*;
 use std::iter;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,7 +44,7 @@ where
 
 /// The local queue of a single level work stealing task queue.
 pub struct LocalQueue<T> {
-    local_queue: Worker<T>,
+    local_queue: Rc<Worker<T>>,
     injector: Arc<Injector<T>>,
     stealers: Vec<Stealer<T>>,
 }
@@ -115,10 +116,25 @@ where
             }
         }
     }
+
+    pub(super) fn local_injector(&self) -> LocalInjector<T> {
+        LocalInjector(self.local_queue.clone())
+    }
+}
+
+pub(crate) struct LocalInjector<T>(Rc<Worker<T>>);
+
+impl<T: TaskCell> LocalInjector<T> {
+    pub(super) fn push(&self, mut task: T) {
+        set_schedule_time(&mut task);
+        self.0.push(task);
+    }
 }
 
 /// Creates a single level work stealing task queue with `local_num` local queues.
-pub fn create<T>(local_num: usize) -> (TaskInjector<T>, Vec<LocalQueue<T>>) {
+pub(crate) fn create<T: Send + 'static>(
+    local_num: usize,
+) -> (super::TaskInjector<T>, Vec<LocalQueueBuilder<T>>) {
     let injector = Arc::new(Injector::new());
     let workers: Vec<_> = iter::repeat_with(Worker::new_lifo)
         .take(local_num)
@@ -127,24 +143,32 @@ pub fn create<T>(local_num: usize) -> (TaskInjector<T>, Vec<LocalQueue<T>>) {
     let local_queues = workers
         .into_iter()
         .enumerate()
-        .map(|(self_index, local_queue)| {
-            let mut stealers: Vec<_> = stealers
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != self_index)
-                .map(|(_, stealer)| stealer.clone())
-                .collect();
-            // Steal with a random start to avoid imbalance.
-            stealers.shuffle(&mut thread_rng());
-            LocalQueue {
-                local_queue,
-                injector: injector.clone(),
-                stealers,
-            }
-        })
+        .map(
+            |(self_index, local_queue)| -> Box<dyn FnOnce() -> super::LocalQueue<T> + Send> {
+                let mut stealers: Vec<_> = stealers
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != self_index)
+                    .map(|(_, stealer)| stealer.clone())
+                    .collect();
+                // Steal with a random start to avoid imbalance.
+                stealers.shuffle(&mut thread_rng());
+                let injector = injector.clone();
+                Box::new(move || {
+                    super::LocalQueue(super::LocalQueueInner::SingleLevel(LocalQueue {
+                        local_queue: Rc::new(local_queue),
+                        injector,
+                        stealers,
+                    }))
+                })
+            },
+        )
         .collect();
 
-    (TaskInjector(injector), local_queues)
+    (
+        super::TaskInjector(super::InjectorInner::SingleLevel(TaskInjector(injector))),
+        local_queues,
+    )
 }
 
 #[cfg(test)]
@@ -181,7 +205,8 @@ mod tests {
     fn test_schedule_time_is_set() {
         const SLEEP_DUR: Duration = Duration::from_millis(5);
 
-        let (injector, mut locals) = super::create(1);
+        let (injector, locals) = super::create(1);
+        let mut locals: Vec<_> = locals.into_iter().map(|b| b()).collect();
         injector.push(MockCell::new(0));
         thread::sleep(SLEEP_DUR);
         let schedule_time = locals[0].pop(true).unwrap().schedule_time;
@@ -190,7 +215,8 @@ mod tests {
 
     #[test]
     fn test_pop_by_stealing_injector() {
-        let (injector, mut locals) = super::create(3);
+        let (injector, locals) = super::create(3);
+        let mut locals: Vec<_> = locals.into_iter().map(|b| b()).collect();
         for i in 0..100 {
             injector.push(MockCell::new(i));
         }
@@ -203,7 +229,12 @@ mod tests {
 
     #[test]
     fn test_pop_without_stealing_workers() {
-        let (injector, mut locals) = super::create(3);
+        let (injector, locals) = super::create(3);
+        let injector = injector.into_single_level();
+        let mut locals: Vec<_> = locals
+            .into_iter()
+            .map(|b| b().into_single_level())
+            .collect();
         for i in 0..50 {
             injector.push(MockCell::new(i));
         }
@@ -232,8 +263,13 @@ mod tests {
     }
 
     #[test]
-    fn test_pop_by_steal_workers() {
-        let (injector, mut locals) = super::create(3);
+    fn test_pop_by_steal_others() {
+        let (injector, locals) = super::create(3);
+        let injector = injector.into_single_level();
+        let mut locals: Vec<_> = locals
+            .into_iter()
+            .map(|b| b().into_single_level())
+            .collect();
         for i in 0..50 {
             injector.push(MockCell::new(i));
         }
@@ -258,9 +294,10 @@ mod tests {
         let sum = Arc::new(AtomicI32::new(0));
         let handles: Vec<_> = locals
             .into_iter()
-            .map(|mut consumer| {
+            .map(|builder| {
                 let sum = sum.clone();
                 thread::spawn(move || {
+                    let mut consumer = builder();
                     while let Some(pop) = consumer.pop(true) {
                         sum.fetch_add(pop.task_cell.value, Ordering::SeqCst);
                     }
