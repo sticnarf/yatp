@@ -26,6 +26,7 @@ criterion = "0.3"
 tokio = { version = "0.2.0", features = ["sync", "rt-threaded"] }
 async-std = "1.0"
 threadpool = "1.0"
+hdrhistogram = "7.0"
 
 [[bench]]
 name = "spawn_many"
@@ -41,6 +42,10 @@ harness = false
 
 [[bench]]
 name = "ping_pong"
+harness = false
+
+[[bench]]
+name = "schedule_delay"
 harness = false
 
 [profile.bench]
