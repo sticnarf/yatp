@@ -267,11 +267,11 @@ impl<T: TaskCell + Send> Local<T> {
     /// If the pool is not busy, other tasks should not preempt the current running task.
     pub(crate) fn need_preempt(&mut self) -> bool {
         fail_point!("need-preempt", |r| { r.unwrap().parse().unwrap() });
-        if self.core.busy_hint() {
-            self.local_queue.has_tasks_or_pull()
-        } else {
-            false
-        }
+        // if self.core.busy_hint() {
+        self.local_queue.has_tasks_or_pull()
+        // } else {
+        // false
+        // }
     }
 }
 
