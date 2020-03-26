@@ -108,8 +108,11 @@ where
             return true;
         }
         loop {
-            match self.injector.steal_batch(&self.local_queue) {
-                Steal::Success(()) => return true,
+            match self.injector.steal() {
+                Steal::Success(task) => {
+                    self.local_queue.push(task);
+                    return true;
+                }
                 Steal::Empty => return false,
                 Steal::Retry => {}
             }

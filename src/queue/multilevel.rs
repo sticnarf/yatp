@@ -179,8 +179,11 @@ where
                     .find(|_| rng.gen_ratio(CHANCE_RATIO, CHANCE_RATIO + 1))
                     .unwrap_or(LEVEL_NUM - 1)
             };
-            match self.level_injectors[expected_level].steal_batch(&self.local_queue) {
-                Steal::Success(()) => return true,
+            match self.level_injectors[expected_level].steal() {
+                Steal::Success(task) => {
+                    self.local_queue.push(task);
+                    return true;
+                }
                 Steal::Empty => return false,
                 Steal::Retry => {}
             }

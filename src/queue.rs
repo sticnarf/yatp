@@ -15,6 +15,8 @@ mod single_level;
 
 pub use self::extras::Extras;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// A cell containing a task and needed extra information.
