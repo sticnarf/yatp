@@ -36,6 +36,7 @@ pub fn is_shutdown(cnt: usize) -> bool {
 pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
     active_workers: AtomicUsize,
+    slot_count: AtomicUsize,
     config: SchedConfig,
 }
 
@@ -44,6 +45,7 @@ impl<T> QueueCore<T> {
         QueueCore {
             global_queue,
             active_workers: AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT),
+            slot_count: AtomicUsize::new(config.min_thread_count),
             config,
         }
     }
@@ -54,7 +56,8 @@ impl<T> QueueCore<T> {
     /// the action.
     pub fn ensure_workers(&self, source: usize) {
         let cnt = self.active_workers.load(Ordering::SeqCst);
-        if (cnt >> WORKER_COUNT_SHIFT) >= self.config.max_thread_count || is_shutdown(cnt) {
+        let slot_count = self.slot_count.load(Ordering::SeqCst);
+        if (cnt >> WORKER_COUNT_SHIFT) >= slot_count || is_shutdown(cnt) {
             return;
         }
 
@@ -118,6 +121,15 @@ impl<T> QueueCore<T> {
             }
         }
     }
+
+    /// Gets the current number of active workers
+    pub fn active_workers(&self) -> usize {
+        self.active_workers.load(Ordering::SeqCst)
+    }
+
+    pub fn set_pool_size(&self, val: usize) {
+        self.slot_count.store(val, Ordering::SeqCst);
+    }
 }
 
 impl<T: TaskCell + Send> QueueCore<T> {
@@ -139,7 +151,7 @@ impl<T: TaskCell + Send> QueueCore<T> {
 /// Note that thread pool can be shutdown and dropped even not all remotes are
 /// dropped.
 pub struct Remote<T> {
-    core: Arc<QueueCore<T>>,
+    pub(crate) core: Arc<QueueCore<T>>,
 }
 
 impl<T: TaskCell + Send> Remote<T> {

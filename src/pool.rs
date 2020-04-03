@@ -48,6 +48,16 @@ impl<T: TaskCell + Send> ThreadPool<T> {
     pub fn remote(&self) -> &Remote<T> {
         &self.remote
     }
+
+    /// Gets the current number of active workers
+    pub fn active_workers(&self) -> usize {
+        self.remote.core.active_workers()
+    }
+
+    /// Sets the maximum number of active workers in the pool
+    pub fn set_pool_size(&self, val: usize) {
+        self.remote.core.set_pool_size(val);
+    }
 }
 
 impl<T: TaskCell + Send> Drop for ThreadPool<T> {
