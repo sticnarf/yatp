@@ -182,6 +182,7 @@ where
         loop {
             let mut pop = self.pop_without_verifying_level()?;
             if let Err(expected_level) = self.verify_level(&mut pop) {
+                pop.task_cell.mut_extras().current_level = expected_level;
                 self.level_injectors[expected_level as usize].push(pop.task_cell);
             } else {
                 return Some(pop);
