@@ -97,7 +97,7 @@ where
         self.local_queue.push(task_cell);
     }
 
-    pub(super) fn pop(&mut self) -> Option<Pop<T>> {
+    fn pop_without_verifying_level(&mut self) -> Option<Pop<T>> {
         fn into_pop<T>(mut t: T, from_local: bool) -> Pop<T>
         where
             T: TaskCell,
@@ -163,6 +163,30 @@ where
             }
         }
         None
+    }
+
+    fn verify_level(&self, pop: &mut Pop<T>) -> Result<(), u8> {
+        let extras = pop.task_cell.mut_extras();
+        if extras.fixed_level.is_none() {
+            if let Some(running_time) = &extras.running_time {
+                let expected_level = self.manager.find_level(running_time.as_duration());
+                if extras.current_level != expected_level {
+                    return Err(expected_level);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn pop(&mut self) -> Option<Pop<T>> {
+        loop {
+            let mut pop = self.pop_without_verifying_level()?;
+            if let Err(expected_level) = self.verify_level(&mut pop) {
+                self.level_injectors[expected_level as usize].push(pop.task_cell);
+            } else {
+                return Some(pop);
+            }
+        }
     }
 
     pub fn has_tasks_or_pull(&mut self) -> bool {
@@ -305,16 +329,20 @@ impl LevelManager {
             Some(level) => level,
             None => {
                 let running_time = running_time.as_duration();
-                self.level_time_threshold
-                    .iter()
-                    .enumerate()
-                    .find(|(_, &threshold)| running_time < threshold)
-                    .map(|(level, _)| level)
-                    .unwrap_or(LEVEL_NUM - 1) as u8
+                self.find_level(running_time)
             }
         };
         extras.current_level = current_level;
         extras.schedule_time = Some(now());
+    }
+
+    fn find_level(&self, running_time: Duration) -> u8 {
+        self.level_time_threshold
+            .iter()
+            .enumerate()
+            .find(|(_, &threshold)| running_time < threshold)
+            .map(|(level, _)| level)
+            .unwrap_or(LEVEL_NUM - 1) as u8
     }
 
     fn maybe_adjust_chance(&self) {
