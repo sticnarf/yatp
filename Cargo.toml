@@ -43,6 +43,10 @@ harness = false
 name = "ping_pong"
 harness = false
 
+[[bench]]
+name = "spawn_side"
+harness = false
+
 [profile.bench]
 codegen-units = 1
 debug = true
