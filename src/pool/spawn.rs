@@ -8,7 +8,7 @@ use crate::pool::SchedConfig;
 use crate::queue::{Extras, LocalQueue, Pop, TaskCell, TaskInjector, WithExtras};
 use fail::fail_point;
 use parking_lot_core::{ParkResult, ParkToken, UnparkToken};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// An usize is used to trace the threads that are working actively.
@@ -36,6 +36,7 @@ pub fn is_shutdown(cnt: usize) -> bool {
 pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
     active_workers: AtomicUsize,
+    idling: AtomicBool,
     config: SchedConfig,
 }
 
@@ -44,6 +45,7 @@ impl<T> QueueCore<T> {
         QueueCore {
             global_queue,
             active_workers: AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT),
+            idling: AtomicBool::new(false),
             config,
         }
     }
@@ -54,13 +56,12 @@ impl<T> QueueCore<T> {
     /// the action.
     pub fn ensure_workers(&self, source: usize) {
         let cnt = self.active_workers.load(Ordering::SeqCst);
-        if (cnt >> WORKER_COUNT_SHIFT) >= self.config.max_thread_count || is_shutdown(cnt) {
+        let working_thread = cnt >> WORKER_COUNT_SHIFT;
+        if working_thread >= self.config.max_thread_count || is_shutdown(cnt) {
             return;
         }
-
-        let addr = self as *const QueueCore<T> as usize;
-        unsafe {
-            parking_lot_core::unpark_one(addr, |_| UnparkToken(source));
+        if working_thread < self.config.min_thread_count || !self.idling.load(Ordering::SeqCst) {
+            self.wake_up_one(source);
         }
     }
 
@@ -116,6 +117,21 @@ impl<T> QueueCore<T> {
                 Ok(_) => return,
                 Err(n) => cnt = n,
             }
+        }
+    }
+
+    pub fn mark_idling(&self) -> bool {
+        !self.idling.compare_and_swap(false, true, Ordering::SeqCst)
+    }
+
+    pub fn mark_not_idling(&self) {
+        self.idling.store(false, Ordering::SeqCst);
+    }
+
+    pub fn wake_up_one(&self, source: usize) {
+        let addr = self as *const QueueCore<T> as usize;
+        unsafe {
+            parking_lot_core::unpark_one(addr, |_| UnparkToken(source));
         }
     }
 }
@@ -215,6 +231,10 @@ impl<T: TaskCell + Send> Local<T> {
 
     pub(crate) fn core(&self) -> &Arc<QueueCore<T>> {
         &self.core
+    }
+
+    pub(crate) fn id(&self) -> usize {
+        self.id
     }
 
     pub(crate) fn pop(&mut self) -> Option<Pop<T>> {

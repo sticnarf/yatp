@@ -3,6 +3,8 @@
 use crate::pool::{Local, Runner};
 use crate::queue::{Pop, TaskCell};
 use parking_lot_core::SpinWait;
+use std::thread;
+use std::time::Duration;
 
 pub(crate) struct WorkerThread<T, R> {
     local: Local<T>,
@@ -22,13 +24,21 @@ where
 {
     #[inline]
     fn pop(&mut self) -> Option<Pop<T>> {
-        // Wait some time before going to sleep, which is more expensive.
-        let mut spin = SpinWait::new();
-        loop {
+        let idling = self.local.core().mark_idling();
+        let mut idle_count = 0;
+        while idling {
             if let Some(t) = self.local.pop() {
+                self.local.core().mark_not_idling();
+                self.local.core().wake_up_one(self.local.id());
                 return Some(t);
             }
-            if !spin.spin() {
+            idle_count += 1;
+            if idle_count < 3 {
+                thread::yield_now();
+            } else if idle_count < 20 {
+                thread::sleep(Duration::from_micros(10));
+            } else {
+                self.local.core().mark_not_idling();
                 break;
             }
         }
