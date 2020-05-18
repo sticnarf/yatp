@@ -61,7 +61,7 @@ impl<T> QueueCore<T> {
             return;
         }
         if working_thread < self.config.min_thread_count
-            || !self.idling_count.load(Ordering::SeqCst) == 0
+            || self.idling_count.load(Ordering::SeqCst) == 0
         {
             self.wake_up_one(source);
         }
