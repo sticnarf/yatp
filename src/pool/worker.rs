@@ -11,9 +11,6 @@ pub(crate) struct WorkerThread<T, R> {
     local: Local<T>,
     runner: R,
     pop_count: u64,
-    skip_count: u64,
-    idle_count: u64,
-    idle_time: Duration,
 }
 
 impl<T, R> WorkerThread<T, R> {
@@ -22,9 +19,6 @@ impl<T, R> WorkerThread<T, R> {
             local,
             runner,
             pop_count: 0,
-            skip_count: 0,
-            idle_count: 0,
-            idle_time: Duration::default(),
         }
     }
 }
@@ -40,45 +34,32 @@ where
         // let mut spin = SpinWait::new();
         self.pop_count += 1;
         let mut counter = 0;
-        // let mut idling = false;
+        let mut idling = false;
         // let mut start = None;
-        'outer: loop {
-            // if !idling {
-            //     let mut current = 0;
-            //     loop {
-            //         match self.local.core().idling.compare_exchange_weak(
-            //             current,
-            //             current + 1,
-            //             SeqCst,
-            //             SeqCst,
-            //         ) {
-            //             Ok(_) => {
-            //                 idling = true;
-            //                 start = Some(Instant::now());
-            //                 break;
-            //             }
-            //             Err(v) => {
-            //                 if v >= 2 {
-            //                     self.skip_count += 1;
-            //                     break 'outer;
-            //                 }
-            //                 current = v;
-            //             }
-            //         }
-            //     }
-            // }
+        loop {
+            if !idling {
+                if self
+                    .local
+                    .core()
+                    .idling
+                    .compare_and_swap(false, true, SeqCst)
+                {
+                    break;
+                } else {
+                    idling = true;
+                }
+            }
             if let Some(t) = self.local.pop() {
-                // self.local.core().idling.fetch_sub(1, SeqCst);
+                self.local.core().idling.store(false, SeqCst);
                 return Some(t);
             }
-            if counter >= 20 {
-                // self.local.core().idling.fetch_sub(1, SeqCst);
-                // self.idle_count += 1;
-                // self.idle_time += start.unwrap().elapsed();
+            if counter < 3 {
+                std::thread::yield_now();
+            } else if counter < 20 {
+                std::thread::sleep(Duration::from_micros(5));
+            } else {
+                self.local.core().idling.store(false, SeqCst);
                 break;
-            }
-            for _ in 0..(1 << i32::min(12, counter + 4)) {
-                spin_loop_hint();
             }
             counter += 1;
             // if !spin.spin() {
