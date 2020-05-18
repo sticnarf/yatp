@@ -36,7 +36,7 @@ pub fn is_shutdown(cnt: usize) -> bool {
 pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
     active_workers: AtomicUsize,
-    pub(crate) idling: AtomicUsize,
+    pub(crate) notified: AtomicBool,
     pub(crate) unpark_count: AtomicUsize,
     config: SchedConfig,
 }
@@ -46,7 +46,7 @@ impl<T> QueueCore<T> {
         QueueCore {
             global_queue,
             active_workers: AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT),
-            idling: AtomicUsize::new(0),
+            notified: AtomicBool::new(false),
             unpark_count: AtomicUsize::new(0),
             config,
         }
@@ -57,11 +57,11 @@ impl<T> QueueCore<T> {
     /// If the method is going to wake up any threads, source is used to trace who triggers
     /// the action.
     pub fn ensure_workers(&self, source: usize) {
-        let cnt = self.active_workers.load(Ordering::SeqCst);
-        if (cnt >> WORKER_COUNT_SHIFT) >= self.config.max_thread_count || is_shutdown(cnt) {
+        if self.notified.load(Ordering::SeqCst) {
             return;
         }
-        if self.idling.load(Ordering::SeqCst) > 0 {
+        let cnt = self.active_workers.load(Ordering::SeqCst);
+        if (cnt >> WORKER_COUNT_SHIFT) >= self.config.max_thread_count || is_shutdown(cnt) {
             return;
         }
 
@@ -81,7 +81,7 @@ impl<T> QueueCore<T> {
         unsafe {
             parking_lot_core::unpark_all(addr, UnparkToken(source));
         }
-        println!("unpark count: {}", self.unpark_count.load(Ordering::SeqCst));
+        // println!("unpark count: {}", self.unpark_count.load(Ordering::SeqCst));
     }
 
     /// Checks if the thread pool is shutting down.
@@ -245,6 +245,9 @@ impl<T: TaskCell + Send> Local<T> {
             parking_lot_core::park(
                 address,
                 || {
+                    if self.core.notified.swap(false, Ordering::SeqCst) {
+                        return false;
+                    }
                     if !self.core.mark_sleep() {
                         return false;
                     }

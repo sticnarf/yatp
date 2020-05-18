@@ -40,41 +40,41 @@ where
         // let mut spin = SpinWait::new();
         self.pop_count += 1;
         let mut counter = 0;
-        let mut idling = false;
-        let mut start = None;
+        // let mut idling = false;
+        // let mut start = None;
         'outer: loop {
-            if !idling {
-                let mut current = 0;
-                loop {
-                    match self.local.core().idling.compare_exchange_weak(
-                        current,
-                        current + 1,
-                        SeqCst,
-                        SeqCst,
-                    ) {
-                        Ok(_) => {
-                            idling = true;
-                            start = Some(Instant::now());
-                            break;
-                        }
-                        Err(v) => {
-                            if v >= 2 {
-                                self.skip_count += 1;
-                                break 'outer;
-                            }
-                            current = v;
-                        }
-                    }
-                }
-            }
+            // if !idling {
+            //     let mut current = 0;
+            //     loop {
+            //         match self.local.core().idling.compare_exchange_weak(
+            //             current,
+            //             current + 1,
+            //             SeqCst,
+            //             SeqCst,
+            //         ) {
+            //             Ok(_) => {
+            //                 idling = true;
+            //                 start = Some(Instant::now());
+            //                 break;
+            //             }
+            //             Err(v) => {
+            //                 if v >= 2 {
+            //                     self.skip_count += 1;
+            //                     break 'outer;
+            //                 }
+            //                 current = v;
+            //             }
+            //         }
+            //     }
+            // }
             if let Some(t) = self.local.pop() {
-                self.local.core().idling.fetch_sub(1, SeqCst);
+                // self.local.core().idling.fetch_sub(1, SeqCst);
                 return Some(t);
             }
             if counter >= 20 {
-                self.local.core().idling.fetch_sub(1, SeqCst);
-                self.idle_count += 1;
-                self.idle_time += start.unwrap().elapsed();
+                // self.local.core().idling.fetch_sub(1, SeqCst);
+                // self.idle_count += 1;
+                // self.idle_time += start.unwrap().elapsed();
                 break;
             }
             for _ in 0..(1 << i32::min(12, counter + 4)) {
@@ -104,10 +104,10 @@ where
             self.runner.handle(&mut self.local, task.task_cell);
         }
         self.runner.end(&mut self.local);
-        println!(
-            "total time: {:?}, idle count: {}, pop count: {}, skip count: {}, park count: {}",
-            self.idle_time, self.idle_count, self.pop_count, self.skip_count, self.local.park_count
-        );
+        // println!(
+        //     "total time: {:?}, idle count: {}, pop count: {}, skip count: {}, park count: {}",
+        //     self.idle_time, self.idle_count, self.pop_count, self.skip_count, self.local.park_count
+        // );
     }
 }
 
