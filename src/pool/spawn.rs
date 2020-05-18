@@ -36,7 +36,7 @@ pub fn is_shutdown(cnt: usize) -> bool {
 pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
     active_workers: AtomicUsize,
-    pub(crate) idling: AtomicBool,
+    pub(crate) notified: AtomicBool,
     pub(crate) unpark_count: AtomicUsize,
     config: SchedConfig,
 }
@@ -46,7 +46,7 @@ impl<T> QueueCore<T> {
         QueueCore {
             global_queue,
             active_workers: AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT),
-            idling: AtomicBool::new(false),
+            notified: AtomicBool::new(false),
             unpark_count: AtomicUsize::new(0),
             config,
         }
@@ -57,18 +57,21 @@ impl<T> QueueCore<T> {
     /// If the method is going to wake up any threads, source is used to trace who triggers
     /// the action.
     pub fn ensure_workers(&self, source: usize) {
-        if self.idling.load(Ordering::SeqCst) {
-            return;
-        }
+        // if self.idling.load(Ordering::SeqCst) {
+        //     return;
+        // }
+        self.notified.store(true, Ordering::SeqCst);
         let cnt = self.active_workers.load(Ordering::SeqCst);
         if (cnt >> WORKER_COUNT_SHIFT) >= self.config.max_thread_count || is_shutdown(cnt) {
             return;
         }
 
-        self.unpark_count.fetch_add(1, Ordering::Relaxed);
-        let addr = self as *const QueueCore<T> as usize;
-        unsafe {
-            parking_lot_core::unpark_one(addr, |_| UnparkToken(source));
+        // self.unpark_count.fetch_add(1, Ordering::Relaxed);
+        if (cnt >> WORKER_COUNT_SHIFT) < self.config.min_thread_count {
+            let addr = self as *const QueueCore<T> as usize;
+            unsafe {
+                parking_lot_core::unpark_one(addr, |_| UnparkToken(source));
+            }
         }
     }
 
@@ -189,7 +192,7 @@ impl<T: Send> AssertSend for Remote<T> {}
 /// instead of global queue, so new tasks can take advantage of cache
 /// coherence.
 pub struct Local<T> {
-    id: usize,
+    pub(crate) id: usize,
     local_queue: LocalQueue<T>,
     core: Arc<QueueCore<T>>,
     pub(crate) park_count: u64,
@@ -240,6 +243,7 @@ impl<T: TaskCell + Send> Local<T> {
         let address = &*self.core as *const QueueCore<T> as usize;
         let mut task = None;
         let id = self.id;
+        let core = self.core().clone();
 
         let res = unsafe {
             parking_lot_core::park(
@@ -255,7 +259,9 @@ impl<T: TaskCell + Send> Local<T> {
                     }
                     res
                 },
-                || {},
+                || {
+                    core.notified.store(false, Ordering::SeqCst);
+                },
                 |_, _| {},
                 ParkToken(id),
                 None,

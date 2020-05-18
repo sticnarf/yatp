@@ -1,8 +1,9 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
+use crate::pool::spawn::QueueCore;
 use crate::pool::{Local, Runner};
 use crate::queue::{Pop, TaskCell};
-use parking_lot_core::SpinWait;
+use parking_lot_core::{SpinWait, UnparkToken};
 use std::sync::atomic::spin_loop_hint;
 use std::sync::atomic::Ordering::*;
 use std::time::{Duration, Instant};
@@ -34,31 +35,37 @@ where
         // let mut spin = SpinWait::new();
         self.pop_count += 1;
         let mut counter = 0;
-        let mut idling = false;
+        // let mut idling = false;
         // let mut start = None;
         loop {
-            if !idling {
-                if self
-                    .local
-                    .core()
-                    .idling
-                    .compare_and_swap(false, true, SeqCst)
-                {
-                    break;
-                } else {
-                    idling = true;
-                }
-            }
+            // if !idling {
+            //     if self
+            //         .local
+            //         .core()
+            //         .idling
+            //         .compare_and_swap(false, true, SeqCst)
+            //     {
+            //         break;
+            //     } else {
+            //         idling = true;
+            //     }
+            // }
             if let Some(t) = self.local.pop() {
-                self.local.core().idling.store(false, SeqCst);
+                // self.local.core().idling.store(false, SeqCst);
+                if self.local.core().notified.load(SeqCst) {
+                    let addr = self.local.core().as_ref() as *const QueueCore<T> as usize;
+                    unsafe {
+                        parking_lot_core::unpark_one(addr, |_| UnparkToken(self.local.id));
+                    }
+                }
                 return Some(t);
             }
             if counter < 3 {
                 std::thread::yield_now();
-            } else if counter < 50 {
-                std::thread::sleep(Duration::from_micros(5));
+            } else if counter < 5 {
+                std::thread::sleep(Duration::from_micros(10));
             } else {
-                self.local.core().idling.store(false, SeqCst);
+                // self.local.core().idling.store(false, SeqCst);
                 break;
             }
             counter += 1;
