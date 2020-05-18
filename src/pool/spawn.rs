@@ -8,7 +8,7 @@ use crate::pool::SchedConfig;
 use crate::queue::{Extras, LocalQueue, Pop, TaskCell, TaskInjector, WithExtras};
 use fail::fail_point;
 use parking_lot_core::{ParkResult, ParkToken, UnparkToken};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// An usize is used to trace the threads that are working actively.
@@ -36,7 +36,7 @@ pub fn is_shutdown(cnt: usize) -> bool {
 pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
     active_workers: AtomicUsize,
-    idling: AtomicBool,
+    idling_count: AtomicUsize,
     config: SchedConfig,
 }
 
@@ -45,7 +45,7 @@ impl<T> QueueCore<T> {
         QueueCore {
             global_queue,
             active_workers: AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT),
-            idling: AtomicBool::new(false),
+            idling_count: AtomicUsize::new(0),
             config,
         }
     }
@@ -60,7 +60,9 @@ impl<T> QueueCore<T> {
         if working_thread >= self.config.max_thread_count || is_shutdown(cnt) {
             return;
         }
-        if working_thread < self.config.min_thread_count || !self.idling.load(Ordering::SeqCst) {
+        if working_thread < self.config.min_thread_count
+            || !self.idling_count.load(Ordering::SeqCst) == 0
+        {
             self.wake_up_one(source);
         }
     }
@@ -121,11 +123,28 @@ impl<T> QueueCore<T> {
     }
 
     pub fn mark_idling(&self) -> bool {
-        !self.idling.compare_and_swap(false, true, Ordering::SeqCst)
+        let mut current = 0;
+        loop {
+            match self.idling_count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => {
+                    if actual > 1 {
+                        return false;
+                    } else {
+                        current = actual;
+                    }
+                }
+            }
+        }
     }
 
     pub fn mark_not_idling(&self) {
-        self.idling.store(false, Ordering::SeqCst);
+        self.idling_count.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub fn wake_up_one(&self, source: usize) {

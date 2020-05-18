@@ -29,13 +29,12 @@ where
         while idling {
             if let Some(t) = self.local.pop() {
                 self.local.core().mark_not_idling();
-                self.local.core().wake_up_one(self.local.id());
                 return Some(t);
             }
             idle_count += 1;
             if idle_count < 3 {
                 thread::yield_now();
-            } else if idle_count < 20 {
+            } else if idle_count < 10 {
                 thread::sleep(Duration::from_micros(10));
             } else {
                 self.local.core().mark_not_idling();
