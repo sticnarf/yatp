@@ -3,15 +3,29 @@
 use crate::pool::{Local, Runner};
 use crate::queue::{Pop, TaskCell};
 use parking_lot_core::SpinWait;
+use std::sync::atomic::spin_loop_hint;
+use std::sync::atomic::Ordering::*;
+use std::time::{Duration, Instant};
 
 pub(crate) struct WorkerThread<T, R> {
     local: Local<T>,
     runner: R,
+    pop_count: u64,
+    skip_count: u64,
+    idle_count: u64,
+    idle_time: Duration,
 }
 
 impl<T, R> WorkerThread<T, R> {
     pub fn new(local: Local<T>, runner: R) -> WorkerThread<T, R> {
-        WorkerThread { local, runner }
+        WorkerThread {
+            local,
+            runner,
+            pop_count: 0,
+            skip_count: 0,
+            idle_count: 0,
+            idle_time: Duration::default(),
+        }
     }
 }
 
@@ -23,14 +37,56 @@ where
     #[inline]
     fn pop(&mut self) -> Option<Pop<T>> {
         // Wait some time before going to sleep, which is more expensive.
-        let mut spin = SpinWait::new();
-        loop {
+        // let mut spin = SpinWait::new();
+        self.pop_count += 1;
+        let mut counter = 0;
+        let mut idling = false;
+        let mut start = None;
+        'outer: loop {
+            if !idling {
+                let mut current = 0;
+                loop {
+                    match self.local.core().idling.compare_exchange_weak(
+                        current,
+                        current + 1,
+                        SeqCst,
+                        SeqCst,
+                    ) {
+                        Ok(_) => {
+                            idling = true;
+                            start = Some(Instant::now());
+                            break;
+                        }
+                        Err(v) => {
+                            if v >= 2 {
+                                self.skip_count += 1;
+                                break 'outer;
+                            }
+                            current = v;
+                        }
+                    }
+                }
+            }
             if let Some(t) = self.local.pop() {
+                self.local.core().idling.fetch_sub(1, SeqCst);
                 return Some(t);
             }
-            if !spin.spin() {
+            if counter >= 20 {
+                self.local.core().idling.fetch_sub(1, SeqCst);
+                self.idle_count += 1;
+                self.idle_time += start.unwrap().elapsed();
                 break;
             }
+            for _ in 0..(1 << i32::min(12, counter + 4)) {
+                spin_loop_hint();
+            }
+            counter += 1;
+            // if !spin.spin() {
+            //     self.local.core().idling.store(false, SeqCst);
+            //     self.idle_count += 1;
+            //     self.idle_time += start.unwrap().elapsed();
+            //     break;
+            // }
         }
         self.runner.pause(&mut self.local);
         let t = self.local.pop_or_sleep();
@@ -48,6 +104,10 @@ where
             self.runner.handle(&mut self.local, task.task_cell);
         }
         self.runner.end(&mut self.local);
+        println!(
+            "total time: {:?}, idle count: {}, pop count: {}, skip count: {}, park count: {}",
+            self.idle_time, self.idle_count, self.pop_count, self.skip_count, self.local.park_count
+        );
     }
 }
 

@@ -27,6 +27,9 @@ tokio = { version = "0.2.0", features = ["sync", "rt-threaded"] }
 async-std = "1.0"
 threadpool = "1.0"
 
+[target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
+jemallocator = "0.3.2"
+
 [[bench]]
 name = "spawn_many"
 harness = false

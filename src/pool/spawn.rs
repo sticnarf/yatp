@@ -8,7 +8,7 @@ use crate::pool::SchedConfig;
 use crate::queue::{Extras, LocalQueue, Pop, TaskCell, TaskInjector, WithExtras};
 use fail::fail_point;
 use parking_lot_core::{ParkResult, ParkToken, UnparkToken};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// An usize is used to trace the threads that are working actively.
@@ -36,6 +36,8 @@ pub fn is_shutdown(cnt: usize) -> bool {
 pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
     active_workers: AtomicUsize,
+    pub(crate) idling: AtomicUsize,
+    pub(crate) unpark_count: AtomicUsize,
     config: SchedConfig,
 }
 
@@ -44,6 +46,8 @@ impl<T> QueueCore<T> {
         QueueCore {
             global_queue,
             active_workers: AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT),
+            idling: AtomicUsize::new(0),
+            unpark_count: AtomicUsize::new(0),
             config,
         }
     }
@@ -57,7 +61,11 @@ impl<T> QueueCore<T> {
         if (cnt >> WORKER_COUNT_SHIFT) >= self.config.max_thread_count || is_shutdown(cnt) {
             return;
         }
+        if self.idling.load(Ordering::SeqCst) > 0 {
+            return;
+        }
 
+        self.unpark_count.fetch_add(1, Ordering::Relaxed);
         let addr = self as *const QueueCore<T> as usize;
         unsafe {
             parking_lot_core::unpark_one(addr, |_| UnparkToken(source));
@@ -73,6 +81,7 @@ impl<T> QueueCore<T> {
         unsafe {
             parking_lot_core::unpark_all(addr, UnparkToken(source));
         }
+        println!("unpark count: {}", self.unpark_count.load(Ordering::SeqCst));
     }
 
     /// Checks if the thread pool is shutting down.
@@ -183,6 +192,7 @@ pub struct Local<T> {
     id: usize,
     local_queue: LocalQueue<T>,
     core: Arc<QueueCore<T>>,
+    pub(crate) park_count: u64,
 }
 
 impl<T: TaskCell + Send> Local<T> {
@@ -191,6 +201,7 @@ impl<T: TaskCell + Send> Local<T> {
             id,
             local_queue,
             core,
+            park_count: 0,
         }
     }
 
@@ -238,7 +249,11 @@ impl<T: TaskCell + Send> Local<T> {
                         return false;
                     }
                     task = self.local_queue.pop();
-                    task.is_none()
+                    let res = task.is_none();
+                    if res {
+                        self.park_count += 1;
+                    }
+                    res
                 },
                 || {},
                 |_, _| {},
