@@ -55,7 +55,7 @@ where
             }
             if counter < 3 {
                 std::thread::yield_now();
-            } else if counter < 20 {
+            } else if counter < 50 {
                 std::thread::sleep(Duration::from_micros(5));
             } else {
                 self.local.core().idling.store(false, SeqCst);
