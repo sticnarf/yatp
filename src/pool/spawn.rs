@@ -100,7 +100,7 @@ impl WorkersInfo for u64 {
 pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
     workers_info: AtomicU64,
-    backup_count: AtomicI64,
+    idling: AtomicU64,
     stats: UtilizationStats,
     active_notified: AtomicBool,
     backup_notified: AtomicBool,
@@ -112,7 +112,7 @@ impl<T> QueueCore<T> {
         QueueCore {
             global_queue,
             workers_info: AtomicU64::new(WorkersInfo::new(config.max_thread_count)),
-            backup_count: AtomicI64::new(0),
+            idling: AtomicU64::new(0),
             active_notified: AtomicBool::new(false),
             backup_notified: AtomicBool::new(false),
             stats: UtilizationStats::new(config.max_thread_count),
@@ -135,7 +135,11 @@ impl<T> QueueCore<T> {
         } else if workers_info.running_count() < self.config.min_thread_count {
             self.unpark_one(false, source);
         } else if source != 0 {
-            self.stats.add_record(workers_info.running_count());
+            self.stats.add_record(
+                workers_info
+                    .running_count()
+                    .saturating_sub(self.idling.load(Ordering::SeqCst) as usize),
+            );
             if self.stats.average() > (workers_info.active_count() - 1) as f64 {
                 self.unpark_one(true, source);
             }
@@ -216,14 +220,6 @@ impl<T> QueueCore<T> {
                 Ordering::SeqCst,
             ) {
                 Ok(_) => {
-                    if workers_info.running_count() < workers_info.active_count() {
-                        let backup_count = self.backup_count.load(Ordering::SeqCst);
-                        if backup_count < 0 {
-                            self.backup_count.store(0, Ordering::SeqCst)
-                        } else {
-                            self.backup_count.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
                     if backup {
                         active_count_histogram.observe((workers_info.active_count() - 1) as f64);
                     }
@@ -261,6 +257,14 @@ impl<T> QueueCore<T> {
                 Err(actual) => workers_info = actual,
             }
         }
+    }
+
+    pub fn mark_idling(&self) {
+        self.idling.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn unmark_idling(&self) {
+        self.idling.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

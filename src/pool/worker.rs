@@ -24,17 +24,28 @@ where
     #[inline]
     fn pop(&mut self) -> Option<Pop<T>> {
         let mut spin = SpinWait::new();
+        let mut idling = false;
         loop {
             if let Some(t) = self.local.pop() {
                 // if t.schedule_time.elapsed() > Duration::from_millis(1) {
                 //     self.local.core().unpark_one(true, self.local.id);
                 // }
+                if idling {
+                    self.local.core().unmark_idling();
+                }
                 self.local.core().ensure_workers(self.local.id);
                 return Some(t);
+            }
+            if !idling {
+                self.local.core().mark_idling();
+                idling = true;
             }
             if !spin.spin() {
                 break;
             }
+        }
+        if idling {
+            self.local.core().unmark_idling();
         }
         self.runner.pause(&mut self.local);
         let t = self.local.pop_or_sleep();
