@@ -2,6 +2,7 @@
 
 use crate::pool::{Local, Runner};
 use crate::queue::{Pop, TaskCell};
+use parking_lot_core::SpinWait;
 use std::thread;
 
 pub(crate) struct WorkerThread<T, R> {
@@ -22,7 +23,8 @@ where
 {
     #[inline]
     fn pop(&mut self) -> Option<Pop<T>> {
-        for counter in 0..10 {
+        let mut spin = SpinWait::new();
+        loop {
             if let Some(t) = self.local.pop() {
                 // if t.schedule_time.elapsed() > Duration::from_millis(1) {
                 //     self.local.core().unpark_one(true, self.local.id);
@@ -30,12 +32,8 @@ where
                 self.local.core().ensure_workers(self.local.id);
                 return Some(t);
             }
-            if counter < 3 {
-                for _ in 0..(1 << counter) {
-                    std::sync::atomic::spin_loop_hint();
-                }
-            } else {
-                thread::yield_now();
+            if !spin.spin() {
+                break;
             }
         }
         self.runner.pause(&mut self.local);

@@ -9,7 +9,10 @@ use crate::queue::{Extras, LocalQueue, Pop, TaskCell, TaskInjector, WithExtras};
 use fail::fail_point;
 use parking_lot_core::{ParkResult, ParkToken, UnparkToken};
 use prometheus::{Histogram, HistogramOpts};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::mem::{self, MaybeUninit};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicIsize, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::Arc;
 
 /// A u64 is used to trace the states of the workers.
@@ -90,8 +93,6 @@ impl WorkersInfo for u64 {
     }
 }
 
-const BACKUP_THRESHOLD: i64 = 64;
-
 /// The core of queues.
 ///
 /// Every thread pool instance should have one and only `QueueCore`. It's
@@ -100,7 +101,9 @@ pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
     workers_info: AtomicU64,
     backup_count: AtomicI64,
-    notified: AtomicBool,
+    stats: UtilizationStats,
+    active_notified: AtomicBool,
+    backup_notified: AtomicBool,
     config: SchedConfig,
 }
 
@@ -110,7 +113,9 @@ impl<T> QueueCore<T> {
             global_queue,
             workers_info: AtomicU64::new(WorkersInfo::new(config.max_thread_count)),
             backup_count: AtomicI64::new(0),
-            notified: AtomicBool::new(false),
+            active_notified: AtomicBool::new(false),
+            backup_notified: AtomicBool::new(false),
+            stats: UtilizationStats::new(config.max_thread_count),
             config,
         }
     }
@@ -130,68 +135,31 @@ impl<T> QueueCore<T> {
         } else if workers_info.running_count() < self.config.min_thread_count {
             self.unpark_one(false, source);
         } else if source != 0 {
-            if workers_info.running_count() == workers_info.active_count() {
-                let mut backup_count = self.backup_count.load(Ordering::SeqCst);
-                if backup_count > 0 {
-                    self.backup_count.store(0, Ordering::SeqCst);
-                } else {
-                    backup_count = self.backup_count.fetch_sub(1, Ordering::SeqCst) - 1;
-                    while backup_count < -BACKUP_THRESHOLD {
-                        match self.backup_count.compare_exchange_weak(
-                            backup_count,
-                            0,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        ) {
-                            Ok(_) => {
-                                self.unpark_one(true, source);
-                                break;
-                            }
-                            Err(actual) => backup_count = actual,
-                        }
-                    }
-                }
-            } else if workers_info.running_count() + 1 < workers_info.active_count() {
-                let backup_count = self.backup_count.load(Ordering::SeqCst);
-                if backup_count < 0 {
-                    self.backup_count.store(0, Ordering::SeqCst)
-                } else {
-                    self.backup_count.fetch_add(1, Ordering::SeqCst);
-                }
-                self.unpark_one(false, source);
-            } else if workers_info.running_count() < workers_info.active_count() {
-                self.unpark_one(false, source);
+            self.stats.add_record(workers_info.running_count());
+            if self.stats.average() > (workers_info.active_count() - 1) as f64 {
+                self.unpark_one(true, source);
             }
         } else if workers_info.running_count() < workers_info.active_count() {
-            if !self
-                .notified
-                .compare_and_swap(false, true, Ordering::SeqCst)
-            {
-                self.unpark_one(false, source);
-            }
+            self.unpark_one(false, source);
         }
     }
 
-    fn unpark_one(&self, backup: bool, source: usize) {
-        unsafe {
-            parking_lot_core::unpark_one(self.park_address(backup), |_| UnparkToken(source));
+    pub fn unpark_one(&self, backup: bool, source: usize) {
+        let notified = if backup {
+            &self.backup_notified
+        } else {
+            &self.active_notified
+        };
+        if !notified.compare_and_swap(false, true, Ordering::SeqCst) {
+            unsafe {
+                parking_lot_core::unpark_one(self.park_address(backup), |_| UnparkToken(source));
+            }
         }
     }
 
     pub fn park_to_backup(&self) -> bool {
-        let mut v = self.backup_count.load(Ordering::SeqCst);
-        loop {
-            if v < BACKUP_THRESHOLD {
-                return false;
-            }
-            match self
-                .backup_count
-                .compare_exchange_weak(v, 0, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => return true,
-                Err(actual) => v = actual,
-            }
-        }
+        let workers_info = self.workers_info.load(Ordering::SeqCst);
+        self.stats.average() < (workers_info.active_count() - 2) as f64
     }
 
     pub fn park_address(&self, backup: bool) -> usize {
@@ -222,11 +190,12 @@ impl<T> QueueCore<T> {
     ///
     /// It can be marked as sleep only when the pool is not shutting down.
     pub fn mark_sleep(&self, backup: bool, active_count_histogram: &Histogram) -> bool {
-        if !backup
-            && self
-                .notified
-                .compare_and_swap(true, false, Ordering::SeqCst)
-        {
+        let notified = if backup {
+            &self.backup_notified
+        } else {
+            &self.active_notified
+        };
+        if notified.compare_and_swap(true, false, Ordering::SeqCst) {
             return false;
         }
         let mut workers_info = self.workers_info.load(Ordering::SeqCst);
@@ -267,9 +236,12 @@ impl<T> QueueCore<T> {
 
     /// Marks current thread as woken up states.
     pub fn mark_woken(&self, backup: bool) {
-        if !backup {
-            self.notified.store(false, Ordering::SeqCst);
-        }
+        let notified = if backup {
+            &self.backup_notified
+        } else {
+            &self.active_notified
+        };
+        notified.store(false, Ordering::SeqCst);
         let mut workers_info = self.workers_info.load(Ordering::SeqCst);
         loop {
             let new_info = if backup {
@@ -303,6 +275,38 @@ impl<T: TaskCell + Send> QueueCore<T> {
 
     fn default_extras(&self) -> Extras {
         self.global_queue.default_extras()
+    }
+}
+
+struct UtilizationStats {
+    records: [AtomicUsize; 256],
+    sum: AtomicIsize,
+    index: AtomicU8,
+}
+
+impl UtilizationStats {
+    fn new(max_thread_count: usize) -> UtilizationStats {
+        let mut records: [MaybeUninit<AtomicUsize>; 256] =
+            unsafe { MaybeUninit::uninit().assume_init() };
+        for r in &mut records[..] {
+            *r = MaybeUninit::new(AtomicUsize::new(max_thread_count));
+        }
+        UtilizationStats {
+            records: unsafe { mem::transmute(records) },
+            sum: AtomicIsize::new(max_thread_count as isize * 256),
+            index: AtomicU8::new(0),
+        }
+    }
+
+    fn add_record(&self, running_count: usize) {
+        let index = self.index.fetch_add(1, Ordering::SeqCst) as usize;
+        let old = self.records[index].swap(running_count, Ordering::SeqCst);
+        let diff = running_count as isize - old as isize;
+        self.sum.fetch_add(diff, Ordering::SeqCst);
+    }
+
+    fn average(&self) -> f64 {
+        self.sum.load(Ordering::SeqCst) as f64 / 256.0
     }
 }
 
