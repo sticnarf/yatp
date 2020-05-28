@@ -51,6 +51,11 @@ impl<T: TaskCell + Send> ThreadPool<T> {
     pub fn remote(&self) -> &Remote<T> {
         &self.remote
     }
+
+    /// Sets the count of active threads in the thread pool dynamically.
+    pub fn set_active_thread_count(&self, thread_count: usize) {
+        self.remote.set_active_thread_count(thread_count);
+    }
 }
 
 impl<T: TaskCell + Send> Drop for ThreadPool<T> {

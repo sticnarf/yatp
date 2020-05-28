@@ -21,12 +21,14 @@ use std::sync::Arc;
 /// Bits represent the thread count
 /// ```
 const SHUTDOWN_BIT: usize = 1;
-const WORKER_COUNT_SHIFT: usize = 1;
-const WORKER_COUNT_BASE: usize = 2;
-
+const ENABLED_COUNT_SHIFT: usize = 1;
 /// Checks if shutdown bit is set.
-pub fn is_shutdown(cnt: usize) -> bool {
-    cnt & SHUTDOWN_BIT == SHUTDOWN_BIT
+pub fn is_shutdown(runtime_settings: usize) -> bool {
+    runtime_settings & SHUTDOWN_BIT == SHUTDOWN_BIT
+}
+
+pub fn enabled_count(runtime_settings: usize) -> usize {
+    runtime_settings >> ENABLED_COUNT_SHIFT
 }
 
 /// The core of queues.
@@ -35,7 +37,9 @@ pub fn is_shutdown(cnt: usize) -> bool {
 /// saved in an `Arc` and shared between all worker threads and remote handles.
 pub(crate) struct QueueCore<T> {
     global_queue: TaskInjector<T>,
+    runtime_settings: AtomicUsize,
     active_workers: AtomicUsize,
+    backup_workers: AtomicUsize,
     config: SchedConfig,
 }
 
@@ -43,7 +47,9 @@ impl<T> QueueCore<T> {
     pub fn new(global_queue: TaskInjector<T>, config: SchedConfig) -> QueueCore<T> {
         QueueCore {
             global_queue,
-            active_workers: AtomicUsize::new(config.max_thread_count << WORKER_COUNT_SHIFT),
+            runtime_settings: AtomicUsize::new(config.max_thread_count << ENABLED_COUNT_SHIFT),
+            active_workers: AtomicUsize::new(config.max_thread_count),
+            backup_workers: AtomicUsize::new(0),
             config,
         }
     }
@@ -53,14 +59,28 @@ impl<T> QueueCore<T> {
     /// If the method is going to wake up any threads, source is used to trace who triggers
     /// the action.
     pub fn ensure_workers(&self, source: usize) {
-        let cnt = self.active_workers.load(Ordering::SeqCst);
-        if (cnt >> WORKER_COUNT_SHIFT) >= self.config.max_thread_count || is_shutdown(cnt) {
+        let active_workers = self.active_workers.load(Ordering::SeqCst);
+        let runtime_settings = self.runtime_settings.load(Ordering::SeqCst);
+        if active_workers >= enabled_count(runtime_settings) || is_shutdown(runtime_settings) {
             return;
         }
 
-        let addr = self as *const QueueCore<T> as usize;
+        let backup = self.backup_workers.load(Ordering::SeqCst)
+            > (self.config.max_thread_count - enabled_count(runtime_settings));
+        self.unpark_one(backup, source);
+    }
+
+    fn unpark_one(&self, backup: bool, source: usize) {
         unsafe {
-            parking_lot_core::unpark_one(addr, |_| UnparkToken(source));
+            parking_lot_core::unpark_one(self.park_address(backup), |_| UnparkToken(source));
+        }
+    }
+
+    pub fn park_address(&self, backup: bool) -> usize {
+        if backup {
+            self as *const QueueCore<T> as usize + 1
+        } else {
+            self as *const QueueCore<T> as usize
         }
     }
 
@@ -77,44 +97,47 @@ impl<T> QueueCore<T> {
 
     /// Checks if the thread pool is shutting down.
     pub fn is_shutdown(&self) -> bool {
-        let cnt = self.active_workers.load(Ordering::SeqCst);
-        is_shutdown(cnt)
+        is_shutdown(self.runtime_settings.load(Ordering::SeqCst))
     }
 
     /// Marks the current thread in sleep state.
     ///
     /// It can be marked as sleep only when the pool is not shutting down.
-    pub fn mark_sleep(&self) -> bool {
-        let mut cnt = self.active_workers.load(Ordering::SeqCst);
-        loop {
-            if is_shutdown(cnt) {
-                return false;
-            }
-
-            match self.active_workers.compare_exchange_weak(
-                cnt,
-                cnt - WORKER_COUNT_BASE,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(n) => cnt = n,
-            }
+    pub fn mark_sleep(&self, backup: bool) -> bool {
+        let runtime_settings = self.runtime_settings.load(Ordering::SeqCst);
+        if is_shutdown(runtime_settings) {
+            return false;
         }
+        self.active_workers.fetch_sub(1, Ordering::SeqCst);
+        if backup {
+            self.backup_workers.fetch_add(1, Ordering::SeqCst);
+        }
+        true
     }
 
     /// Marks current thread as woken up states.
-    pub fn mark_woken(&self) {
-        let mut cnt = self.active_workers.load(Ordering::SeqCst);
+    pub fn mark_woken(&self, backup: bool) {
+        self.active_workers.fetch_add(1, Ordering::SeqCst);
+        if backup {
+            self.backup_workers.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn set_active_thread_count(&self, thread_count: usize) {
+        let mut runtime_settings = self.runtime_settings.load(Ordering::Relaxed);
         loop {
-            match self.active_workers.compare_exchange_weak(
-                cnt,
-                cnt + WORKER_COUNT_BASE,
+            if is_shutdown(runtime_settings) {
+                return;
+            }
+            let new_settings = thread_count << ENABLED_COUNT_SHIFT;
+            match self.runtime_settings.compare_exchange_weak(
+                runtime_settings,
+                new_settings,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
                 Ok(_) => return,
-                Err(n) => cnt = n,
+                Err(n) => runtime_settings = n,
             }
         }
     }
@@ -155,6 +178,11 @@ impl<T: TaskCell + Send> Remote<T> {
 
     pub(crate) fn stop(&self) {
         self.core.mark_shutdown(0);
+    }
+
+    /// Sets the count of active threads in the thread pool dynamically.
+    pub fn set_active_thread_count(&self, thread_count: usize) {
+        self.core.set_active_thread_count(thread_count);
     }
 }
 
@@ -226,7 +254,10 @@ impl<T: TaskCell + Send> Local<T> {
     /// If there are no tasks at the moment, it will go to sleep until woken
     /// up by other threads.
     pub(crate) fn pop_or_sleep(&mut self) -> Option<Pop<T>> {
-        let address = &*self.core as *const QueueCore<T> as usize;
+        let backup = self.core().backup_workers.load(Ordering::SeqCst)
+            < (self.core().config.max_thread_count
+                - enabled_count(self.core.runtime_settings.load(Ordering::SeqCst)));
+        let address = self.core().park_address(backup);
         let mut task = None;
         let id = self.id;
 
@@ -234,11 +265,11 @@ impl<T: TaskCell + Send> Local<T> {
             parking_lot_core::park(
                 address,
                 || {
-                    if !self.core.mark_sleep() {
+                    task = self.local_queue.pop();
+                    if task.is_some() {
                         return false;
                     }
-                    task = self.local_queue.pop();
-                    task.is_none()
+                    self.core.mark_sleep(backup)
                 },
                 || {},
                 |_, _| {},
@@ -248,7 +279,7 @@ impl<T: TaskCell + Send> Local<T> {
         };
         match res {
             ParkResult::Unparked(_) | ParkResult::Invalid => {
-                self.core.mark_woken();
+                self.core.mark_woken(backup);
                 task
             }
             ParkResult::TimedOut => unreachable!(),
