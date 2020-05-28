@@ -137,7 +137,15 @@ impl<T> QueueCore<T> {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    let previous_count = enabled_count(runtime_settings);
+                    if thread_count > previous_count {
+                        for _ in previous_count..thread_count {
+                            self.unpark_one(true, 0);
+                        }
+                    }
+                    return;
+                }
                 Err(n) => runtime_settings = n,
             }
         }
