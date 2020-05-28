@@ -65,8 +65,8 @@ impl<T> QueueCore<T> {
             return;
         }
 
-        let backup = self.backup_workers.load(Ordering::SeqCst)
-            > (self.config.max_thread_count - enabled_count(runtime_settings));
+        let expected_backup = self.config.max_thread_count - enabled_count(runtime_settings);
+        let backup = self.backup_workers.load(Ordering::SeqCst) > expected_backup;
         self.unpark_one(backup, source);
     }
 
@@ -88,10 +88,11 @@ impl<T> QueueCore<T> {
     ///
     /// `source` is used to trace who triggers the action.
     pub fn mark_shutdown(&self, source: usize) {
-        self.active_workers.fetch_or(SHUTDOWN_BIT, Ordering::SeqCst);
-        let addr = self as *const QueueCore<T> as usize;
+        self.runtime_settings
+            .fetch_or(SHUTDOWN_BIT, Ordering::SeqCst);
         unsafe {
-            parking_lot_core::unpark_all(addr, UnparkToken(source));
+            parking_lot_core::unpark_all(self.park_address(true), UnparkToken(source));
+            parking_lot_core::unpark_all(self.park_address(false), UnparkToken(source));
         }
     }
 
@@ -259,6 +260,7 @@ impl<T: TaskCell + Send> Local<T> {
                 - enabled_count(self.core.runtime_settings.load(Ordering::SeqCst)));
         let address = self.core().park_address(backup);
         let mut task = None;
+        let mut parked = false;
         let id = self.id;
 
         let res = unsafe {
@@ -269,6 +271,7 @@ impl<T: TaskCell + Send> Local<T> {
                     if task.is_some() {
                         return false;
                     }
+                    parked = true;
                     self.core.mark_sleep(backup)
                 },
                 || {},
@@ -279,7 +282,9 @@ impl<T: TaskCell + Send> Local<T> {
         };
         match res {
             ParkResult::Unparked(_) | ParkResult::Invalid => {
-                self.core.mark_woken(backup);
+                if parked {
+                    self.core.mark_woken(backup);
+                }
                 task
             }
             ParkResult::TimedOut => unreachable!(),
