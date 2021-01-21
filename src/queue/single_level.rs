@@ -120,7 +120,7 @@ where
 /// Creates a single level work stealing task queue with `local_num` local queues.
 pub fn create<T>(local_num: usize) -> (TaskInjector<T>, Vec<LocalQueue<T>>) {
     let injector = Arc::new(Injector::new());
-    let workers: Vec<_> = iter::repeat_with(Worker::new_lifo)
+    let workers: Vec<_> = iter::repeat_with(Worker::new_fifo)
         .take(local_num)
         .collect();
     let stealers: Vec<_> = workers.iter().map(Worker::stealer).collect();

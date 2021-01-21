@@ -560,7 +560,7 @@ impl Builder {
     fn build_raw<T>(self, local_num: usize) -> (TaskInjector<T>, Vec<LocalQueue<T>>) {
         let level_injectors: Arc<[Injector<T>; LEVEL_NUM]> =
             Arc::new([Injector::new(), Injector::new(), Injector::new()]);
-        let workers: Vec<_> = iter::repeat_with(Worker::new_lifo)
+        let workers: Vec<_> = iter::repeat_with(Worker::new_fifo)
             .take(local_num)
             .collect();
         let stealers: Vec<_> = workers.iter().map(Worker::stealer).collect();
